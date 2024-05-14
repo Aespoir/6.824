@@ -55,6 +55,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			}
 			err = finishTask(reply.ID, "map")
 			if err != nil {
+				log.Println(err)
 				return
 			}
 		case "Reduce":
@@ -66,16 +67,6 @@ func Worker(mapf func(string, string) []KeyValue,
 			if err != nil {
 				return
 			}
-		case "Merge":
-			err = mergeTask(reply.N)
-			if err != nil {
-				return
-			}
-			err = finishTask(reply.ID, "merge")
-			if err != nil {
-				return
-			}
-			break
 		case "Exit":
 			break
 		case "Wait":
@@ -105,7 +96,7 @@ func getTask() (GetTaskReply, error) {
 func finishTask(id int, taskName string) error {
 	args := FinishArgs{}
 	args.ID = id
-	args.taskName = taskName
+	args.TaskName = taskName
 	reply := FinishReply{}
 
 	ok := call("Coordinator.FinishTask", &args, &reply)
@@ -136,19 +127,29 @@ func mapTask(mapf func(string, string) []KeyValue, files []string, nReduce int, 
 			nIntermediate[key] = append(nIntermediate[key], v)
 		}
 	}
-	for i := 1; i <= nReduce; i++ {
+	for i := 0; i < nReduce; i++ {
 		// 写入临时文件
 		// mr-X-Y, X is the map task number, while Y is the reduce task number
 		filename := fmt.Sprintf("mr-%d-%d", ID, i)
 		ofile, err := os.CreateTemp("", filename)
 		if err != nil {
+			log.Fatalf("%s\n", err)
 			return err
 		}
-		for _, v := range nIntermediate[i-1] {
-			_, _ = fmt.Fprintf(ofile, "%v %v\n", v.Key, v.Value)
+		for _, v := range nIntermediate[i] {
+			_, err = fmt.Fprintf(ofile, "%v %v\n", v.Key, v.Value)
+			if err != nil {
+				log.Fatalln(err)
+			}
 		}
-		_ = os.Rename(ofile.Name(), filename)
-		_ = ofile.Close()
+		err = os.Rename(ofile.Name(), filename)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		err = ofile.Close()
+		if err != nil {
+			log.Fatalln(err)
+		}
 	}
 	return nil
 }
@@ -156,7 +157,7 @@ func mapTask(mapf func(string, string) []KeyValue, files []string, nReduce int, 
 func reduceTask(reducef func(string, []string) string, nMap int, ID int) error {
 	intermediate := make([]KeyValue, 0)
 	// 从所有mr-nMap-ID文件中读取数据
-	for i := 1; i <= nMap; i++ {
+	for i := 0; i < nMap; i++ {
 		filename := fmt.Sprintf("mr-%d-%d", i, ID)
 		file, err := os.Open(filename)
 		if err != nil {
@@ -193,36 +194,6 @@ func reduceTask(reducef func(string, []string) string, nMap int, ID int) error {
 		i = j
 	}
 	_ = os.Rename(ofile.Name(), filename)
-	return nil
-}
-
-func mergeTask(nReduce int) error {
-	// mr-out-0
-	intermediate := make([]KeyValue, 0)
-	for i := 1; i <= nReduce; i++ {
-		filename := fmt.Sprintf("mr-out-%d", i)
-		file, err := os.Open(filename)
-		if err != nil {
-			log.Fatalf("cannot open %v", filename)
-		}
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			line := strings.Split(scanner.Text(), " ")
-			intermediate = append(intermediate, KeyValue{line[0], line[1]})
-		}
-		_ = file.Close()
-	}
-	sort.Sort(ByKey(intermediate))
-	filename := "mr-out-0"
-	ofile, _ := os.CreateTemp("", filename)
-
-	for i := 0; i < len(intermediate); i++ {
-		_, _ = fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, intermediate[i].Value)
-	}
-
-	_ = os.Rename(ofile.Name(), filename)
-	_ = ofile.Close()
-
 	return nil
 }
 

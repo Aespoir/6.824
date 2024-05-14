@@ -21,7 +21,7 @@ type GetTaskReply struct {
 
 type FinishArgs struct {
 	ID       int
-	taskName string
+	TaskName string
 }
 
 type FinishReply struct {

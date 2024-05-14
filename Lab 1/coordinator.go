@@ -18,16 +18,20 @@ import (
 // rm mr-*
 // go run mrworker.go wc.so
 
+// go build -buildmode=plugin ../mrapps/crash.go
+// rm mr-*
+// go run mrworker.go crash.so
+
 type Coordinator struct {
 	// Your definitions here.
 	mapTasks    Tasks
 	reduceTasks Tasks
-	mergeTask   Tasks
 
 	nMap    int
 	nReduce int
 
-	finish chan struct{}
+	mapCh    []chan struct{}
+	reduceCh []chan struct{}
 }
 
 // 对于map任务：需要 任务ID，files 待处理的文件地址
@@ -69,22 +73,23 @@ func (t *Tasks) IsAllDone() bool {
 func (t *Tasks) Finish(id int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.T[id-1].status = 0
-	t.finished++
+	if t.T[id].status == 1 {
+		t.T[id].status = 0
+		t.finished++
+	}
 }
 
 // Restart set a task's status to 2, means some worker failed to finish task
 func (t *Tasks) Restart(id int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.T[id-1].status = 2
+	if t.T[id].status == 1 {
+		t.T[id].status = 2
+	}
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
-// GetTask TODO：
-// 1. 互斥变量上锁
-// 2. 检测超时task重新派送task
 func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	if task, n, allDone := c.mapTasks.TestAndGet(); !allDone {
 		// buffered chan, for quit
@@ -94,72 +99,61 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 			return nil
 		}
 
-		go c.startTask(task.ID, &c.mapTasks)
-
 		reply.Instruction = "Map"
 		reply.Files = task.files
 		reply.N = c.nReduce
 		reply.ID = task.ID
+
+		go c.startMapTask(task.ID, &c.mapTasks)
 	} else if task, n, allDone = c.reduceTasks.TestAndGet(); !allDone {
 		if n == 0 {
 			// all work is doing
 			reply.Instruction = "Wait"
 			return nil
 		}
-
-		go c.startTask(task.ID, &c.reduceTasks)
+		go c.startReduceTask(task.ID, &c.reduceTasks)
 
 		reply.Instruction = "Reduce"
 		reply.Files = task.files
 		reply.N = c.nMap
 		reply.ID = task.ID
 	} else {
-
-		//} else if task, n, allDone = c.mergeTask.TestAndGet(); !allDone {
-		//	if n == 0 {
-		//		// all work is doing
-		//		reply.Instruction = "Wait"
-		//		return nil
-		//	}
-		//
-		//	go c.startTask(task.ID, &c.mergeTask)
-		//
-		//	reply.Instruction = "Merge"
-		//	reply.Files = task.files
-		//	reply.N = c.nReduce
-		//	reply.ID = task.ID
-		//} else {
-
 		reply.Instruction = "Exit"
 	}
-
 	return nil
 }
 
-func startTimer(t int, ch chan<- struct{}) {
-	time.Sleep(time.Duration(t) * time.Second)
-	ch <- struct{}{}
-	close(ch)
+func (c *Coordinator) startMapTask(id int, tasks *Tasks) {
+	quit := time.After(10 * time.Second)
+
+	select {
+	case <-c.mapCh[id]:
+		tasks.Finish(id)
+	case <-quit:
+		tasks.Restart(id)
+	}
 }
 
-func (c *Coordinator) startTask(id int, tasks *Tasks) {
-	quit := make(chan struct{}, 1)
-	go startTimer(10, quit)
-	for {
-		select {
-		case <-c.finish:
-			tasks.Finish(id)
-			return
-		case <-quit:
-			tasks.Restart(id)
-			return
-		}
+func (c *Coordinator) startReduceTask(id int, tasks *Tasks) {
+	quit := time.After(10 * time.Second)
+
+	select {
+	case <-c.reduceCh[id]:
+		tasks.Finish(id)
+	case <-quit:
+		tasks.Restart(id)
 	}
 }
 
 func (c *Coordinator) FinishTask(args *FinishArgs, reply *FinishReply) error {
 	// finishMapID := args.ID
-	c.finish <- struct{}{}
+	switch args.TaskName {
+	case "map":
+		c.mapCh[args.ID] <- struct{}{}
+	case "reduce":
+		c.reduceCh[args.ID] <- struct{}{}
+	}
+
 	// log.Printf("%d finish %s work\n", args.ID, args.taskName)
 	return nil
 }
@@ -199,7 +193,15 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		nReduce: nReduce,
 		nMap:    len(files),
-		finish:  make(chan struct{}),
+	}
+
+	c.mapCh = make([]chan struct{}, c.nMap)
+	for i := 0; i < c.nMap; i++ {
+		c.mapCh[i] = make(chan struct{})
+	}
+	c.reduceCh = make([]chan struct{}, c.nReduce)
+	for i := 0; i < c.nReduce; i++ {
+		c.reduceCh[i] = make(chan struct{})
 	}
 
 	// Your code here.
@@ -209,17 +211,14 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.mapTasks = Tasks{}
 	for i, file := range files {
 		c.mapTasks.T = append(c.mapTasks.T,
-			Task{files: []string{file}, ID: i + 1, status: 2})
+			Task{files: []string{file}, ID: i, status: 2})
 	}
 
 	c.reduceTasks = Tasks{}
-	for i := 1; i <= nReduce; i++ {
+	for i := 0; i < nReduce; i++ {
 		c.reduceTasks.T = append(c.reduceTasks.T,
 			Task{files: []string{}, ID: i, status: 2})
 	}
-
-	c.mergeTask = Tasks{}
-	c.mergeTask.T = append(c.mergeTask.T, Task{ID: 1, status: 2})
 
 	c.server()
 	return &c

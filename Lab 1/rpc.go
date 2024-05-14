@@ -20,7 +20,8 @@ type GetTaskReply struct {
 }
 
 type FinishArgs struct {
-	ID int
+	ID       int
+	taskName string
 }
 
 type FinishReply struct {

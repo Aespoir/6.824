@@ -7,74 +7,160 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
+
+// cd 6.5840/src/main
+
+// go run mrcoordinator.go pg-*.txt
+
+// go build -buildmode=plugin ../mrapps/wc.go
+// rm mr-*
+// go run mrworker.go wc.so
 
 type Coordinator struct {
 	// Your definitions here.
-	files     []string
-	nReduce   int
-	nMap      int
-	wgMap     sync.WaitGroup
-	wgReduce  sync.WaitGroup
-	wgMerge   sync.WaitGroup
-	mWorks    int
-	nWorks    int
-	finalWork int
+	mapTasks    Tasks
+	reduceTasks Tasks
+	mergeTask   Tasks
+
+	nMap    int
+	nReduce int
+
+	finish chan struct{}
+}
+
+// 对于map任务：需要 任务ID，files 待处理的文件地址
+// 对于reduce任务：需要 任务ID，m个map worker的地址
+
+type Task struct {
+	files  []string
+	ID     int
+	status int8 // 2 means to do, 1 means doing, 0 means done
+}
+
+type Tasks struct {
+	T        []Task
+	mu       sync.Mutex
+	finished int
+}
+
+func (t *Tasks) TestAndGet() (Task, int, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.finished == len(t.T) {
+		return Task{}, 0, true
+	}
+	for i := range t.T {
+		if t.T[i].status == 2 {
+			t.T[i].status = 1
+			return t.T[i], 1, false
+		}
+	}
+	return Task{}, 0, false
+}
+
+func (t *Tasks) IsAllDone() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.finished == len(t.T)
+}
+
+func (t *Tasks) Finish(id int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.T[id-1].status = 0
+	t.finished++
+}
+
+// Restart set a task's status to 2, means some worker failed to finish task
+func (t *Tasks) Restart(id int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.T[id-1].status = 2
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
+// GetTask TODO：
+// 1. 互斥变量上锁
+// 2. 检测超时task重新派送task
 func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
-	// 判断map任务是否全部完成，没完成继续返回map指令
-	// 全部完成返回reduce指令
-	// 判断reduce是否全部完成，没完成返回reduce指令
-	// 全部完成返回please exit指令
+	if task, n, allDone := c.mapTasks.TestAndGet(); !allDone {
+		// buffered chan, for quit
+		if n == 0 {
+			// all work is doing
+			reply.Instruction = "Wait"
+			return nil
+		}
 
-	// 简单的先全部分发给一个worker
-	if c.mWorks > 0 {
-		c.mWorks--
+		go c.startTask(task.ID, &c.mapTasks)
+
 		reply.Instruction = "Map"
-		reply.Files = c.files
+		reply.Files = task.files
 		reply.N = c.nReduce
-		reply.ID = c.mWorks
-		c.wgMap.Add(1)
-	} else if c.nWorks > 0 {
-		c.nWorks--
-		c.wgMap.Wait() // 等待全部map任务完成
+		reply.ID = task.ID
+	} else if task, n, allDone = c.reduceTasks.TestAndGet(); !allDone {
+		if n == 0 {
+			// all work is doing
+			reply.Instruction = "Wait"
+			return nil
+		}
+
+		go c.startTask(task.ID, &c.reduceTasks)
+
 		reply.Instruction = "Reduce"
-		reply.ID = c.nWorks
+		reply.Files = task.files
 		reply.N = c.nMap
-		c.wgReduce.Add(1)
-	} else if c.finalWork > 0 {
-		c.wgReduce.Wait()
-		c.finalWork--
-		c.wgMerge.Add(1)
-		reply.Instruction = "Merge"
-		reply.N = c.nReduce
+		reply.ID = task.ID
 	} else {
+
+		//} else if task, n, allDone = c.mergeTask.TestAndGet(); !allDone {
+		//	if n == 0 {
+		//		// all work is doing
+		//		reply.Instruction = "Wait"
+		//		return nil
+		//	}
+		//
+		//	go c.startTask(task.ID, &c.mergeTask)
+		//
+		//	reply.Instruction = "Merge"
+		//	reply.Files = task.files
+		//	reply.N = c.nReduce
+		//	reply.ID = task.ID
+		//} else {
+
 		reply.Instruction = "Exit"
 	}
 
 	return nil
 }
 
-// FinishMap
-func (c *Coordinator) FinishMap(args *FinishArgs, reply *FinishReply) error {
+func startTimer(t int, ch chan<- struct{}) {
+	time.Sleep(time.Duration(t) * time.Second)
+	ch <- struct{}{}
+	close(ch)
+}
+
+func (c *Coordinator) startTask(id int, tasks *Tasks) {
+	quit := make(chan struct{}, 1)
+	go startTimer(10, quit)
+	for {
+		select {
+		case <-c.finish:
+			tasks.Finish(id)
+			return
+		case <-quit:
+			tasks.Restart(id)
+			return
+		}
+	}
+}
+
+func (c *Coordinator) FinishTask(args *FinishArgs, reply *FinishReply) error {
 	// finishMapID := args.ID
-	c.wgMap.Done()
-	return nil
-}
-
-// FinishReduce
-func (c *Coordinator) FinishReduce(args *FinishArgs, reply *FinishReply) error {
-	// finishReduceID = args.ID
-	c.wgReduce.Done()
-	return nil
-}
-
-// FinishMerge
-func (c *Coordinator) FinishMerge(args *FinishArgs, reply *FinishReply) error {
-	c.wgMerge.Done()
+	c.finish <- struct{}{}
+	// log.Printf("%d finish %s work\n", args.ID, args.taskName)
 	return nil
 }
 
@@ -90,6 +176,7 @@ func (c *Coordinator) server() {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
+	// log.Printf("start server at %s\n", sockname)
 }
 
 // main/mrcoordinator.go calls Done() periodically to find out
@@ -98,8 +185,7 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-	if c.mWorks == 0 && c.nWorks == 0 && c.finalWork == 0 {
-		c.wgMerge.Wait()
+	if c.reduceTasks.IsAllDone() {
 		ret = true
 	}
 
@@ -111,18 +197,30 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		nReduce:   nReduce,
-		nMap:      len(files),
-		files:     files,
-		wgMap:     sync.WaitGroup{},
-		wgReduce:  sync.WaitGroup{},
-		wgMerge:   sync.WaitGroup{},
-		mWorks:    len(files),
-		nWorks:    nReduce,
-		finalWork: 1,
+		nReduce: nReduce,
+		nMap:    len(files),
+		finish:  make(chan struct{}),
 	}
 
 	// Your code here.
+
+	// create tasks
+	// 均分
+	c.mapTasks = Tasks{}
+	for i, file := range files {
+		c.mapTasks.T = append(c.mapTasks.T,
+			Task{files: []string{file}, ID: i + 1, status: 2})
+	}
+
+	c.reduceTasks = Tasks{}
+	for i := 1; i <= nReduce; i++ {
+		c.reduceTasks.T = append(c.reduceTasks.T,
+			Task{files: []string{}, ID: i, status: 2})
+	}
+
+	c.mergeTask = Tasks{}
+	c.mergeTask.T = append(c.mergeTask.T, Task{ID: 1, status: 2})
+
 	c.server()
 	return &c
 }

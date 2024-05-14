@@ -53,7 +53,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			if err != nil {
 				return
 			}
-			err = finishMap(reply.ID)
+			err = finishTask(reply.ID, "map")
 			if err != nil {
 				return
 			}
@@ -62,7 +62,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			if err != nil {
 				return
 			}
-			err = finishReduce(reply.ID)
+			err = finishTask(reply.ID, "reduce")
 			if err != nil {
 				return
 			}
@@ -71,13 +71,16 @@ func Worker(mapf func(string, string) []KeyValue,
 			if err != nil {
 				return
 			}
-			err = finishMerge()
+			err = finishTask(reply.ID, "merge")
 			if err != nil {
 				return
 			}
 			break
 		case "Exit":
 			break
+		case "Wait":
+			// log.Println("sleep 5 seconds")
+			time.Sleep(5 * time.Second)
 		default:
 			// unknown instruction, break
 			break
@@ -99,39 +102,13 @@ func getTask() (GetTaskReply, error) {
 	return reply, nil
 }
 
-func finishMap(id int) error {
+func finishTask(id int, taskName string) error {
 	args := FinishArgs{}
 	args.ID = id
+	args.taskName = taskName
 	reply := FinishReply{}
 
-	ok := call("Coordinator.FinishMap", &args, &reply)
-	if !ok {
-		fmt.Printf("call failed!\n")
-		return errors.New("call failed!\n")
-	}
-
-	return nil
-}
-
-func finishReduce(id int) error {
-	args := FinishArgs{}
-	args.ID = id
-	reply := FinishReply{}
-
-	ok := call("Coordinator.FinishReduce", &args, &reply)
-	if !ok {
-		fmt.Printf("call failed!\n")
-		return errors.New("call failed!\n")
-	}
-
-	return nil
-}
-
-func finishMerge() error {
-	args := FinishArgs{}
-	reply := FinishReply{}
-
-	ok := call("Coordinator.FinishMerge", &args, &reply)
+	ok := call("Coordinator.FinishTask", &args, &reply)
 	if !ok {
 		fmt.Printf("call failed!\n")
 		return errors.New("call failed!\n")
@@ -159,26 +136,27 @@ func mapTask(mapf func(string, string) []KeyValue, files []string, nReduce int, 
 			nIntermediate[key] = append(nIntermediate[key], v)
 		}
 	}
-	for i := 0; i < nReduce; i++ {
+	for i := 1; i <= nReduce; i++ {
 		// 写入临时文件
 		// mr-X-Y, X is the map task number, while Y is the reduce task number
-		ofile, err := os.Create(fmt.Sprintf("mr-%d-%d", ID, i))
+		filename := fmt.Sprintf("mr-%d-%d", ID, i)
+		ofile, err := os.CreateTemp("", filename)
 		if err != nil {
 			return err
 		}
-		for _, v := range nIntermediate[i] {
+		for _, v := range nIntermediate[i-1] {
 			_, _ = fmt.Fprintf(ofile, "%v %v\n", v.Key, v.Value)
 		}
+		_ = os.Rename(ofile.Name(), filename)
 		_ = ofile.Close()
 	}
-	fmt.Println("finish map")
 	return nil
 }
 
 func reduceTask(reducef func(string, []string) string, nMap int, ID int) error {
 	intermediate := make([]KeyValue, 0)
 	// 从所有mr-nMap-ID文件中读取数据
-	for i := 0; i < nMap; i++ {
+	for i := 1; i <= nMap; i++ {
 		filename := fmt.Sprintf("mr-%d-%d", i, ID)
 		file, err := os.Open(filename)
 		if err != nil {
@@ -192,7 +170,11 @@ func reduceTask(reducef func(string, []string) string, nMap int, ID int) error {
 		_ = file.Close()
 	}
 	sort.Sort(ByKey(intermediate))
-	ofile, _ := os.Create(fmt.Sprintf("mr-out-%d", ID+1))
+	filename := fmt.Sprintf("mr-out-%d", ID)
+	ofile, _ := os.CreateTemp("", filename)
+	defer func() {
+		_ = ofile.Close()
+	}()
 
 	i := 0
 	for i < len(intermediate) {
@@ -210,7 +192,7 @@ func reduceTask(reducef func(string, []string) string, nMap int, ID int) error {
 
 		i = j
 	}
-	fmt.Println("finish reduce")
+	_ = os.Rename(ofile.Name(), filename)
 	return nil
 }
 
@@ -235,7 +217,7 @@ func mergeTask(nReduce int) error {
 	ofile, _ := os.CreateTemp("", filename)
 
 	for i := 0; i < len(intermediate); i++ {
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, intermediate[i].Value)
+		_, _ = fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, intermediate[i].Value)
 	}
 
 	_ = os.Rename(ofile.Name(), filename)

@@ -1,13 +1,12 @@
 package mr
 
 import (
-	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
-	"strings"
 	"time"
 )
 import "log"
@@ -127,6 +126,7 @@ func mapTask(mapf func(string, string) []KeyValue, files []string, nReduce int, 
 			nIntermediate[key] = append(nIntermediate[key], v)
 		}
 	}
+
 	for i := 0; i < nReduce; i++ {
 		// 写入临时文件
 		// mr-X-Y, X is the map task number, while Y is the reduce task number
@@ -136,8 +136,9 @@ func mapTask(mapf func(string, string) []KeyValue, files []string, nReduce int, 
 			log.Fatalf("%s\n", err)
 			return err
 		}
+		enc := json.NewEncoder(ofile)
 		for _, v := range nIntermediate[i] {
-			_, err = fmt.Fprintf(ofile, "%v %v\n", v.Key, v.Value)
+			err = enc.Encode(v)
 			if err != nil {
 				log.Fatalln(err)
 			}
@@ -163,10 +164,13 @@ func reduceTask(reducef func(string, []string) string, nMap int, ID int) error {
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
 		}
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			line := strings.Split(scanner.Text(), " ")
-			intermediate = append(intermediate, KeyValue{line[0], line[1]})
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
 		}
 		_ = file.Close()
 	}

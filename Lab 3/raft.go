@@ -78,13 +78,20 @@ type Raft struct {
 	identity    int8
 	currentTerm int
 	votedFor    int
+	log         []ApplyMsg
+	commitIndex int
+	lastApplied int
+
+	// leader
+	nextIndex  []int
+	matchIndex []int
 
 	// follower
 	leaderID int
 
 	// channels
-	heartbeat         chan struct{}
-	terminateElection chan struct{}
+	heartbeat    chan struct{}
+	stopElection chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -176,7 +183,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if rf.identity == CANDIDATE {
 			rf.identity = FOLLOWER
-			rf.terminateElection <- struct{}{}
+			rf.stopElection <- struct{}{}
 		} else if rf.identity == LEADER {
 			rf.identity = FOLLOWER
 		}
@@ -287,6 +294,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 
+	term, isLeader = rf.GetState()
+	if isLeader == false {
+		return index, term, isLeader
+	}
+
 	return index, term, isLeader
 }
 
@@ -316,14 +328,14 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 		_, isLeader := rf.GetState()
 		if isLeader {
-			ms := HEARTBEATTIMEOUT*2 + (rand.Int63() % HEARTBEATTIMEOUT) // at most 10 times heartbeat per second
+			ms := HEARTBEATTIMEOUT*2 + (rand.Int63() % HEARTBEATTIMEOUT) // at most 10 times heartbeat per second 100-150
 			heartbeatTimeout := time.After(time.Duration(ms) * time.Millisecond)
 			select {
 			case <-heartbeatTimeout:
 				rf.startHeartbeat()
 			}
 		} else {
-			ms := ELECTIONTIMEOUT*4 + (rand.Int63() % ELECTIONTIMEOUT) // 1200-1600
+			ms := ELECTIONTIMEOUT + (rand.Int63() % ELECTIONTIMEOUT) // 300-600
 			electionTimeout := time.After(time.Duration(ms) * time.Millisecond)
 			select {
 			case <-electionTimeout:
@@ -406,7 +418,7 @@ func (rf *Raft) startElection(ms int64) {
 			return
 		case <-stop:
 			return
-		case <-rf.terminateElection:
+		case <-rf.stopElection:
 			return
 		}
 	}
@@ -443,7 +455,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.leaderID = NOLEADER
 
 	rf.heartbeat = make(chan struct{})
-	rf.terminateElection = make(chan struct{})
+	rf.stopElection = make(chan struct{})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
